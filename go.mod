@@ -2,7 +2,10 @@ module todolist
 
 go 1.24.1
 
-require fyne.io/fyne/v2 v2.5.5
+require (
+	fyne.io/fyne/v2 v2.5.5
+	github.com/lib/pq v1.10.9
+)
 
 require (
 	fyne.io/systray v1.11.0 // indirect

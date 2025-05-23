@@ -12,15 +12,15 @@ type CustomTheme struct{}
 func (t *CustomTheme) Color(name fyne.ThemeColorName, variant fyne.ThemeVariant) color.Color {
 	switch name {
 	case theme.ColorNameBackground:
-		return color.NRGBA{R: 30, G: 144, B: 255, A: 255} // Синий фон (DodgerBlue)
+		return color.NRGBA{R: 30, G: 144, B: 255, A: 255}
 	case theme.ColorNameButton:
-		return color.NRGBA{R: 70, G: 130, B: 180, A: 255} // Более темный синий для кнопок (SteelBlue)
+		return color.NRGBA{R: 70, G: 130, B: 180, A: 255}
 	case theme.ColorNameForeground:
-		return color.White // Белый цвет текста для контраста
+		return color.Black
 	case theme.ColorNamePlaceHolder:
-		return color.NRGBA{R: 200, G: 200, B: 200, A: 255} // Светло-серый для placeholder
+		return color.NRGBA{R: 200, G: 200, B: 200, A: 255}
 	case theme.ColorNamePrimary:
-		return color.NRGBA{R: 0, G: 191, B: 255, A: 255} // Ярко-синий для акцентов (DeepSkyBlue)
+		return color.NRGBA{R: 0, G: 191, B: 255, A: 255}
 	default:
 		return theme.DefaultTheme().Color(name, variant)
 	}
