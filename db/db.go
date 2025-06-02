@@ -1,9 +1,9 @@
+// db.go
 package db
 
 import (
 	"database/sql"
 	"fmt"
-	"hash/crc32"
 	"log"
 	"todolist/models"
 
@@ -45,19 +45,60 @@ func Close() error {
 	return nil
 }
 
-func GetOrCreateDefaultUser() (int, error) {
-
-	tgID := int64(crc32.ChecksumIEEE([]byte("student")))
-
-	var userID int
-	err := DB.QueryRow("SELECT id FROM users WHERE tg_id = $1", tgID).Scan(&userID)
-	if err == sql.ErrNoRows {
-		err = DB.QueryRow(
-			"INSERT INTO users (tg_id) VALUES ($1) RETURNING id",
-			tgID,
-		).Scan(&userID)
+func GetAllUsers() ([]models.User, error) {
+	rows, err := DB.Query("SELECT id, tg_id FROM users")
+	if err != nil {
+		return nil, err
 	}
-	return userID, err
+	defer rows.Close()
+
+	var users []models.User
+	for rows.Next() {
+		var user models.User
+		if err := rows.Scan(&user.ID, &user.TgID); err != nil {
+			return nil, err
+		}
+		users = append(users, user)
+	}
+	return users, rows.Err()
+}
+
+func CreateUser(user *models.User) error {
+	return DB.QueryRow(
+		"INSERT INTO users (tg_id) VALUES ($1) RETURNING id",
+		user.TgID,
+	).Scan(&user.ID)
+}
+
+func DeleteUser(userID int) error {
+	tx, err := DB.Begin()
+	if err != nil {
+		return fmt.Errorf("ошибка начала транзакции: %v", err)
+	}
+
+	//Удаляет пользователя
+	if _, err := tx.Exec("DELETE FROM tasks WHERE list_id IN (SELECT id FROM todo_lists WHERE user_id = $1)", userID); err != nil {
+		tx.Rollback()
+		return fmt.Errorf("ошибка удаления задач: %v", err)
+	}
+
+	// Удаляет списки пользователя
+	if _, err := tx.Exec("DELETE FROM todo_lists WHERE user_id = $1", userID); err != nil {
+		tx.Rollback()
+		return fmt.Errorf("ошибка удаления списков: %v", err)
+	}
+
+	// Удляет самого пользователя
+	if _, err := tx.Exec("DELETE FROM users WHERE id = $1", userID); err != nil {
+		tx.Rollback()
+		return fmt.Errorf("ошибка удаления пользователя: %v", err)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("ошибка коммита транзакции: %v", err)
+	}
+
+	return nil
 }
 
 func CreateTodoList(list *models.TodoList) error {

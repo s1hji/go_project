@@ -1,7 +1,13 @@
+// gui.go
 package gui
 
 import (
+	"encoding/json"
 	"fmt"
+	"hash/crc32"
+	"os"
+	"strings"
+	"sync"
 	"time"
 	"todolist/db"
 	"todolist/models"
@@ -13,15 +19,194 @@ import (
 	"fyne.io/fyne/v2/widget"
 )
 
-const dateFormat = "02.01.2006"
+const (
+	dateFormat    = "02.01.2006"
+	userNamesFile = "user_names.json"
+)
 
-func ShowTodoLists(w fyne.Window) {
-	userID, err := db.GetOrCreateDefaultUser()
+var (
+	userNames   = make(map[int]string)
+	userNamesMu sync.RWMutex
+)
+
+func addEnterHandler(entry *widget.Entry, callback func()) {
+	entry.OnSubmitted = func(s string) {
+		callback()
+	}
+}
+
+func init() {
+	loadUserNames()
+}
+
+func loadUserNames() {
+	data, err := os.ReadFile(userNamesFile)
 	if err != nil {
-		dialog.ShowError(fmt.Errorf("Ошибка получения пользователя: %v", err), w)
 		return
 	}
 
+	userNamesMu.Lock()
+	defer userNamesMu.Unlock()
+	json.Unmarshal(data, &userNames)
+}
+
+func saveUserNames() {
+	userNamesMu.RLock()
+	defer userNamesMu.RUnlock()
+
+	data, err := json.Marshal(userNames)
+	if err != nil {
+		return
+	}
+	os.WriteFile(userNamesFile, data, 0644)
+}
+
+func ShowUserSelection(w fyne.Window) {
+	users, err := db.GetAllUsers()
+	if err != nil {
+		dialog.ShowError(fmt.Errorf("Ошибка загрузки пользователей: %v", err), w)
+		return
+	}
+
+	mainContainer := container.NewVBox(
+		widget.NewLabelWithStyle("Выберите пользователя", fyne.TextAlignCenter, fyne.TextStyle{Bold: true}),
+		layout.NewSpacer(),
+	)
+
+	usersContainer := container.NewVBox()
+	for _, user := range users {
+		u := user
+		userName := getUserName(u.ID)
+
+		userRow := container.NewHBox(
+			widget.NewButton(userName, func() {
+				ShowTodoLists(w, u.ID)
+			}),
+			layout.NewSpacer(),
+			widget.NewButton("✕", func() {
+				showDeleteUserDialog(w, u)
+			}),
+		)
+		usersContainer.Add(userRow)
+		usersContainer.Add(layout.NewSpacer())
+	}
+
+	addButton := widget.NewButton("+ Создать нового пользователя", func() {
+		showCreateUserDialog(w)
+	})
+	addButtonContainer := container.NewHBox(
+		layout.NewSpacer(),
+		addButton,
+		layout.NewSpacer(),
+	)
+
+	mainContainer.Add(usersContainer)
+	mainContainer.Add(layout.NewSpacer())
+	mainContainer.Add(addButtonContainer)
+	mainContainer.Add(layout.NewSpacer())
+
+	w.SetContent(mainContainer)
+}
+
+func showDeleteUserDialog(w fyne.Window, user models.User) {
+	dialog.ShowConfirm(
+		"Удаление пользователя",
+		fmt.Sprintf("Удалить пользователя '%s' и все его данные?", getUserName(user.ID)),
+		func(ok bool) {
+			if !ok {
+				return
+			}
+
+			if err := db.DeleteUser(user.ID); err != nil {
+				dialog.ShowError(err, w)
+				return
+			}
+
+			userNamesMu.Lock()
+			delete(userNames, user.ID)
+			userNamesMu.Unlock()
+			saveUserNames()
+
+			ShowUserSelection(w)
+		},
+		w,
+	)
+}
+
+func showCreateUserDialog(w fyne.Window) {
+	entry := widget.NewEntry()
+	entry.SetPlaceHolder("Имя пользователя")
+
+	// Создаем диалог
+	d := dialog.NewForm(
+		"Новый пользователь",
+		"Создать",
+		"Отмена",
+		[]*widget.FormItem{
+			{Text: "Имя:", Widget: entry},
+		},
+		func(confirmed bool) {
+			if !confirmed || entry.Text == "" {
+				return
+			}
+
+			user := models.User{
+				TgID: int64(crc32.ChecksumIEEE([]byte(entry.Text))),
+			}
+
+			if err := db.CreateUser(&user); err != nil {
+				dialog.ShowError(err, w)
+				return
+			}
+
+			userNamesMu.Lock()
+			userNames[user.ID] = entry.Text
+			userNamesMu.Unlock()
+			saveUserNames()
+
+			ShowTodoLists(w, user.ID)
+		},
+		w,
+	)
+
+	// Показываем диалог
+	d.Show()
+
+	// Обработчик Enter
+	addEnterHandler(entry, func() {
+		if entry.Text == "" {
+			return
+		}
+
+		user := models.User{
+			TgID: int64(crc32.ChecksumIEEE([]byte(entry.Text))),
+		}
+
+		if err := db.CreateUser(&user); err != nil {
+			dialog.ShowError(err, w)
+			return
+		}
+
+		userNamesMu.Lock()
+		userNames[user.ID] = entry.Text
+		userNamesMu.Unlock()
+		saveUserNames()
+
+		d.Hide()
+		ShowTodoLists(w, user.ID)
+	})
+}
+
+func getUserName(userID int) string {
+	userNamesMu.RLock()
+	defer userNamesMu.RUnlock()
+	if name, exists := userNames[userID]; exists {
+		return name
+	}
+	return fmt.Sprintf("Пользователь %d", userID)
+}
+
+func ShowTodoLists(w fyne.Window, userID int) {
 	lists, err := db.GetTodoLists(userID)
 	if err != nil {
 		dialog.ShowError(fmt.Errorf("Ошибка загрузки списков: %v", err), w)
@@ -38,38 +223,25 @@ func ShowTodoLists(w fyne.Window) {
 	for _, list := range lists {
 		currentList := list
 
-		// Чекбокс для отметки выполнения
 		check := widget.NewCheck("", func(checked bool) {
-			// Здесь можно добавить логику отметки списка как выполненного
-			// Например, обновить в базе данных
 			fmt.Printf("Список %s отмечен как выполненный: %v\n", currentList.Title, checked)
 		})
 
-		// Кнопка списка
 		listBtn := widget.NewButton(currentList.Title, func() {
 			ShowTodoItems(w, currentList)
 		})
 		listBtn.Alignment = widget.ButtonAlignLeading
 
-		// Кнопка удаления
 		deleteBtn := widget.NewButton("✕", func() {
-			dialog.ShowConfirm(
-				"Удаление списка",
-				"Удалить этот список и все его задачи?",
-				func(ok bool) {
-					if ok {
-						if err := db.DeleteTodoList(currentList.ID); err != nil {
-							dialog.ShowError(err, w)
-							return
-						}
-						ShowTodoLists(w)
-					}
-				},
-				w,
-			)
+			showDeleteConfirmDialog(w, "Удаление списка", "Удалить этот список и все его задачи?", func() {
+				if err := db.DeleteTodoList(currentList.ID); err != nil {
+					dialog.ShowError(err, w)
+					return
+				}
+				ShowTodoLists(w, userID)
+			})
 		})
 
-		// Собираем строку списка
 		listRow := container.NewHBox(
 			check,
 			listBtn,
@@ -78,7 +250,7 @@ func ShowTodoLists(w fyne.Window) {
 		)
 
 		listsContainer.Add(listRow)
-		listsContainer.Add(layout.NewSpacer()) // Отступ между списками
+		listsContainer.Add(container.NewPadded(container.NewVBox(layout.NewSpacer())))
 	}
 
 	scrollContainer := container.NewVScroll(listsContainer)
@@ -87,7 +259,6 @@ func ShowTodoLists(w fyne.Window) {
 	mainContainer.Add(scrollContainer)
 	mainContainer.Add(layout.NewSpacer())
 
-	// Кнопка добавления
 	addButton := widget.NewButton("+ Добавить список", func() {
 		showAddListDialog(w, userID)
 	})
@@ -103,7 +274,29 @@ func ShowTodoLists(w fyne.Window) {
 	mainContainer.Add(addButtonContainer)
 	mainContainer.Add(layout.NewSpacer())
 
+	backButton := widget.NewButton("← Назад к пользователям", func() {
+		ShowUserSelection(w)
+	})
+
+	mainContainer.Add(backButton)
+
 	w.SetContent(mainContainer)
+}
+
+func showDeleteConfirmDialog(w fyne.Window, title, message string, onConfirm func()) {
+	content := widget.NewLabel(message)
+	dialog.ShowCustomConfirm(
+		title,
+		"Да",
+		"Нет",
+		content,
+		func(ok bool) {
+			if ok {
+				onConfirm()
+			}
+		},
+		w,
+	)
 }
 
 func showAddListDialog(w fyne.Window, userID int) {
@@ -115,7 +308,6 @@ func showAddListDialog(w fyne.Window, userID int) {
 	descEntry.MultiLine = true
 	descEntry.Wrapping = fyne.TextWrapWord
 
-	// Создаем контейнер с формой и кнопками
 	formContent := container.NewVBox(
 		widget.NewLabelWithStyle("Новый список", fyne.TextAlignCenter, fyne.TextStyle{Bold: true}),
 		widget.NewLabel("Название:"),
@@ -131,21 +323,17 @@ func showAddListDialog(w fyne.Window, userID int) {
 		layout.NewSpacer(),
 	)
 
-	// Объединяем все в один контейнер
 	content := container.NewBorder(
 		nil, buttons, nil, nil,
 		formContent,
 	)
 
-	// Создаем диалог с нашим контентом
 	d := dialog.NewCustomWithoutButtons("",
 		container.NewPadded(content),
 		w,
 	)
 
-	// Назначаем действия для кнопок
-	buttons.Objects[1].(*widget.Button).OnTapped = d.Hide
-	buttons.Objects[2].(*widget.Button).OnTapped = func() {
+	createList := func() {
 		if titleEntry.Text != "" {
 			newList := models.TodoList{
 				UserID:      userID,
@@ -158,10 +346,17 @@ func showAddListDialog(w fyne.Window, userID int) {
 				dialog.ShowError(err, w)
 				return
 			}
-			ShowTodoLists(w)
+			ShowTodoLists(w, userID)
 			d.Hide()
 		}
 	}
+
+	// Добавляем обработчики Enter
+	addEnterHandler(titleEntry, createList)
+	addEnterHandler(descEntry, createList)
+
+	buttons.Objects[1].(*widget.Button).OnTapped = d.Hide
+	buttons.Objects[2].(*widget.Button).OnTapped = createList
 
 	d.Resize(fyne.NewSize(400, 300))
 	d.Show()
@@ -186,24 +381,20 @@ func ShowTodoItems(w fyne.Window, list models.TodoList) {
 	})
 
 	backButton := widget.NewButton("← Назад", func() {
-		ShowTodoLists(w)
+		ShowTodoLists(w, list.UserID)
 	})
 
 	deleteListButton := widget.NewButton("Удалить список", func() {
-		dialog.ShowConfirm(
+		showDeleteConfirmDialog(w,
 			"Удаление списка",
 			"Вы уверены, что хотите удалить этот список и все его задачи?",
-			func(ok bool) {
-				if ok {
-					if err := db.DeleteTodoList(list.ID); err != nil {
-						dialog.ShowError(err, w)
-						return
-					}
-					ShowTodoLists(w)
+			func() {
+				if err := db.DeleteTodoList(list.ID); err != nil {
+					dialog.ShowError(err, w)
+					return
 				}
-			},
-			w,
-		)
+				ShowTodoLists(w, list.UserID)
+			})
 	})
 
 	controls := container.NewHBox(
@@ -225,43 +416,50 @@ func createTaskRow(w fyne.Window, task *models.Task, list models.TodoList) *fyne
 	taskBtn := widget.NewButton("", nil)
 	taskBtn.Alignment = widget.ButtonAlignLeading
 
-	updateTaskText := func() {
+	// Функция обновления текста и цвета задачи
+	updateTask := func() {
 		text := task.Title
 		if !task.DueDate.IsZero() {
 			text += " (" + task.DueDate.Format(dateFormat) + ")"
 		}
 		taskBtn.SetText(text)
+
+		// Устанавливаем цвет в зависимости от статуса и даты
+		if task.IsDone {
+			taskBtn.Importance = widget.LowImportance // Серый для выполненных
+		} else if !task.DueDate.IsZero() && task.DueDate.Before(time.Now()) {
+			taskBtn.Importance = widget.DangerImportance // Красный для просроченных
+		} else {
+			taskBtn.Importance = widget.MediumImportance // Обычный цвет
+		}
 	}
-	updateTaskText()
+	updateTask()
 
 	taskBtn.OnTapped = func() {
-		showTaskDetails(w, task, updateTaskText)
+		showTaskDetails(w, task, updateTask)
 	}
 
 	check := widget.NewCheck("", func(done bool) {
 		task.IsDone = done
 		if err := db.UpdateTask(task); err != nil {
 			dialog.ShowError(err, w)
+			return
 		}
-		updateTaskText()
+		updateTask() // Обновляем цвет после изменения статуса
 	})
 	check.SetChecked(task.IsDone)
 
 	deleteBtn := widget.NewButton("✕", func() {
-		dialog.ShowConfirm(
+		showDeleteConfirmDialog(w,
 			"Удаление",
 			"Удалить задачу?",
-			func(ok bool) {
-				if ok {
-					if err := db.DeleteTask(task.ID); err != nil {
-						dialog.ShowError(err, w)
-						return
-					}
-					ShowTodoItems(w, list)
+			func() {
+				if err := db.DeleteTask(task.ID); err != nil {
+					dialog.ShowError(err, w)
+					return
 				}
-			},
-			w,
-		)
+				ShowTodoItems(w, list)
+			})
 	})
 
 	return container.NewHBox(
@@ -273,9 +471,14 @@ func createTaskRow(w fyne.Window, task *models.Task, list models.TodoList) *fyne
 }
 
 func showAddTaskDialog(w fyne.Window, list models.TodoList) {
-	// Поля формы
 	titleEntry := widget.NewEntry()
 	titleEntry.SetPlaceHolder("Название задачи")
+	titleEntry.Validator = func(s string) error {
+		if s == "" {
+			return fmt.Errorf("введите название задачи")
+		}
+		return nil
+	}
 
 	descEntry := widget.NewEntry()
 	descEntry.SetPlaceHolder("Описание задачи")
@@ -285,85 +488,191 @@ func showAddTaskDialog(w fyne.Window, list models.TodoList) {
 	dateEntry := widget.NewEntry()
 	dateEntry.SetPlaceHolder("дд.мм.гггг")
 
-	// Форма
-	form := &widget.Form{
-		Items: []*widget.FormItem{
-			{Text: "Название:", Widget: titleEntry},
-			{Text: "Описание:", Widget: descEntry},
-			{Text: "Срок:", Widget: dateEntry},
-		},
-	}
+	// Автоформатирование даты
+	dateEntry.OnChanged = func(s string) {
+		if s == "" {
+			return
+		}
 
-	// Создаем диалог
-	d := dialog.NewForm(
-		"Новая задача",
-		"Добавить",
-		"Отмена",
-		form.Items,
-		func(confirmed bool) {
-			if !confirmed {
-				return
-			}
+		cursorPos := dateEntry.CursorColumn
+		cleanStr := strings.ReplaceAll(s, ".", "")
 
-			// Обработка добавления задачи
-			var dueDate time.Time
-			if dateText := dateEntry.Text; dateText != "" {
-				if parsed, err := time.Parse(dateFormat, dateText); err == nil {
-					dueDate = parsed
+		if len(cleanStr) > 8 {
+			cleanStr = cleanStr[:8]
+			cursorPos = 10
+		}
+
+		var formatted strings.Builder
+		for i, r := range cleanStr {
+			if i == 2 || i == 4 {
+				formatted.WriteRune('.')
+				if cursorPos > i {
+					cursorPos++
 				}
 			}
+			formatted.WriteRune(r)
+		}
 
-			task := models.Task{
-				ListID:      list.ID,
-				Title:       titleEntry.Text,
-				Description: descEntry.Text,
-				DueDate:     dueDate,
-				CreatedAt:   time.Now(),
+		newText := formatted.String()
+		if newText != s {
+			dateEntry.SetText(newText)
+			if cursorPos < len(newText) {
+				dateEntry.CursorColumn = cursorPos
+			} else {
+				dateEntry.CursorColumn = len(newText)
 			}
+		}
+	}
 
-			if err := db.CreateTask(&task); err != nil {
-				dialog.ShowError(err, w)
+	// Создаем контейнер с формой
+	form := widget.NewForm(
+		widget.NewFormItem("Название:", titleEntry),
+		widget.NewFormItem("Описание:", descEntry),
+		widget.NewFormItem("Срок:", dateEntry),
+	)
+
+	// Создаем кнопки
+	submitBtn := widget.NewButton("Добавить", nil)
+	cancelBtn := widget.NewButton("Отмена", nil)
+
+	buttons := container.NewHBox(
+		layout.NewSpacer(),
+		cancelBtn,
+		submitBtn,
+	)
+
+	// Собираем основной контент
+	content := container.NewVBox(
+		form,
+		buttons,
+	)
+
+	// Создаем диалог
+	d := dialog.NewCustomWithoutButtons("Новая задача", content, w)
+
+	// Назначаем действия кнопкам после создания диалога
+	submitBtn.OnTapped = func() {
+		if titleEntry.Validate() != nil {
+			return
+		}
+
+		var dueDate time.Time
+		if dateText := dateEntry.Text; dateText != "" {
+			parsed, err := time.Parse(dateFormat, dateText)
+			if err != nil {
+				dialog.ShowError(fmt.Errorf("неверный формат даты. Используйте дд.мм.гггг"), w)
 				return
 			}
-			ShowTodoItems(w, list)
-		},
-		w,
-	)
+			dueDate = parsed
+		}
+
+		task := models.Task{
+			ListID:      list.ID,
+			Title:       titleEntry.Text,
+			Description: descEntry.Text,
+			DueDate:     dueDate,
+			CreatedAt:   time.Now(),
+		}
+
+		if err := db.CreateTask(&task); err != nil {
+			dialog.ShowError(err, w)
+			return
+		}
+
+		d.Hide()
+		ShowTodoItems(w, list)
+	}
+
+	cancelBtn.OnTapped = func() {
+		d.Hide()
+	}
+
+	// Обработчики Enter
+	addEnterHandler(titleEntry, func() {
+		descEntry.FocusGained()
+	})
+
+	addEnterHandler(descEntry, func() {
+		dateEntry.FocusGained()
+	})
+
+	addEnterHandler(dateEntry, func() {
+		if titleEntry.Validate() == nil {
+			submitBtn.OnTapped()
+		}
+	})
 
 	d.Resize(fyne.NewSize(400, 300))
 	d.Show()
 }
+
 func showTaskDetails(w fyne.Window, task *models.Task, onUpdate func()) {
+	// Создаем элементы интерфейса
 	titleLabel := widget.NewLabelWithStyle(task.Title, fyne.TextAlignLeading, fyne.TextStyle{Bold: true})
+
 	descLabel := widget.NewLabel(task.Description)
 	descLabel.Wrapping = fyne.TextWrapWord
 
+	// Создаем лейбл для даты
 	dateText := "Срок не установлен"
 	if !task.DueDate.IsZero() {
 		dateText = "Срок: " + task.DueDate.Format(dateFormat)
+		if task.DueDate.Before(time.Now()) && !task.IsDone {
+			dateText += " (ПРОСРОЧЕНО)"
+		}
 	}
-	dateLabel := widget.NewLabel(dateText)
 
+	dateLabel := widget.NewLabel(dateText)
+	if !task.DueDate.IsZero() && task.DueDate.Before(time.Now()) && !task.IsDone {
+		dateLabel = widget.NewLabelWithStyle(dateText, fyne.TextAlignLeading, fyne.TextStyle{Bold: true})
+		dateLabel.Importance = widget.DangerImportance // Устанавливаем красный цвет через Importance
+	}
+
+	// Кнопка редактирования
 	editBtn := widget.NewButton("Редактировать", func() {
 		editTaskDialog(w, task, func() {
 			onUpdate()
-			showTaskDetails(w, task, onUpdate)
+			// Обновляем текст
+			titleLabel.SetText(task.Title)
+			descLabel.SetText(task.Description)
+
+			// Обновляем дату
+			newDateText := "Срок не установлен"
+			if !task.DueDate.IsZero() {
+				newDateText = "Срок: " + task.DueDate.Format(dateFormat)
+				if task.DueDate.Before(time.Now()) && !task.IsDone {
+					newDateText += " (ПРОСРОЧЕНО)"
+				}
+			}
+			dateLabel.SetText(newDateText)
+
+			// Обновляем стиль
+			if !task.DueDate.IsZero() && task.DueDate.Before(time.Now()) && !task.IsDone {
+				dateLabel.Importance = widget.DangerImportance
+			} else {
+				dateLabel.Importance = widget.MediumImportance
+			}
 		})
 	})
 
-	dialog.ShowCustom(
+	// Создаем контейнер с содержимым
+	content := container.NewVBox(
+		titleLabel,
+		widget.NewSeparator(),
+		descLabel,
+		dateLabel,
+		layout.NewSpacer(),
+		editBtn,
+	)
+
+	// Создаем и показываем диалог
+	d := dialog.NewCustom(
 		"Детали задачи",
 		"Закрыть",
-		container.NewVBox(
-			titleLabel,
-			widget.NewSeparator(),
-			descLabel,
-			dateLabel,
-			layout.NewSpacer(),
-			editBtn,
-		),
+		content,
 		w,
 	)
+	d.Show()
 }
 
 func editTaskDialog(w fyne.Window, task *models.Task, onSave func()) {
@@ -379,7 +688,51 @@ func editTaskDialog(w fyne.Window, task *models.Task, onSave func()) {
 		dateEntry.SetText(task.DueDate.Format(dateFormat))
 	}
 
-	dialog.ShowForm(
+	// Ограничение длины ввода
+	dateEntry.Validator = func(s string) error {
+		cleanStr := strings.ReplaceAll(s, ".", "")
+		if len(cleanStr) > 8 {
+			return fmt.Errorf("максимум 8 цифр (ддммгггг)")
+		}
+		return nil
+	}
+
+	// Автоматическое форматирование даты
+	dateEntry.OnChanged = func(s string) {
+		if s == "" {
+			return
+		}
+
+		// Удаляем все нецифры
+		var cleanStr strings.Builder
+		for _, r := range s {
+			if r >= '0' && r <= '9' {
+				cleanStr.WriteRune(r)
+			}
+		}
+
+		// Форматируем с точками
+		var formatted strings.Builder
+		digits := cleanStr.String()
+		for i, r := range digits {
+			if i == 2 || i == 4 {
+				formatted.WriteRune('.')
+			}
+			if i >= 8 { // Ограничиваем 8 цифрами
+				break
+			}
+			formatted.WriteRune(r)
+		}
+
+		// Обновляем поле ввода
+		newText := formatted.String()
+		if newText != s {
+			dateEntry.SetText(newText)
+			dateEntry.CursorColumn = len(newText)
+		}
+	}
+
+	d := dialog.NewForm(
 		"Редактировать",
 		"Сохранить",
 		"Отмена",
@@ -393,6 +746,15 @@ func editTaskDialog(w fyne.Window, task *models.Task, onSave func()) {
 				return
 			}
 
+			// Проверка даты перед сохранением
+			if dateText := dateEntry.Text; dateText != "" {
+				if _, err := time.Parse(dateFormat, dateText); err != nil {
+					dialog.ShowError(fmt.Errorf("неверная дата. Формат: дд.мм.гггг"), w)
+					return
+				}
+			}
+
+			// Остальная логика сохранения...
 			task.Title = titleEntry.Text
 			task.Description = descEntry.Text
 
@@ -413,4 +775,5 @@ func editTaskDialog(w fyne.Window, task *models.Task, onSave func()) {
 		},
 		w,
 	)
+	d.Show()
 }
